@@ -14,7 +14,7 @@ def proxy_image():
     if not url:
         return Response('Missing url', status=400)
     try:
-        r = requests.get(url, timeout=10, headers={
+        r = requests.get(url, timeout=20, headers={
             'User-Agent': 'Mozilla/5.0',
             'Referer':    'https://open.spotify.com/',
         })
@@ -47,10 +47,7 @@ def proxy_rss():
         base_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'localhost:5000')
         base_url = f"https://{base_url}" if not base_url.startswith('http') else base_url
 
-        def proxy_img(url):
-            if not url:
-                return None
-            return f"{base_url}/image?url={requests.utils.quote(url, safe='')}"
+        # proxy_img désactivé — URLs brutes retournées
 
         items = []
         for item in channel.findall('item'):
@@ -90,7 +87,7 @@ def proxy_rss():
             # Pochette épisode
             img_item = item.find('itunes:image', ns)
             pochette_raw = img_item.get('href') if img_item is not None else None
-            pochette = proxy_img(pochette_raw or podcast_image)
+            pochette = pochette_raw or podcast_image  # URL brute, pas de proxy
 
             # Date
             pub_date = get('pubDate') or ''
