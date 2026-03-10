@@ -1,44 +1,50 @@
 import os
 import re
 import html
+import hashlib
 import threading
+import time
 import requests
 from flask import Flask, Response, request, jsonify
 from xml.etree import ElementTree as ET
 
 app = Flask(__name__)
 
-RSS_URL  = 'https://anchor.fm/s/1016b2f68/podcast/rss'
+RSS_URL   = 'https://anchor.fm/s/1016b2f68/podcast/rss'
+CACHE_DIR = '/tmp/hdr_images'
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ─── Cache en mémoire ──────────────────────────────────────────────────────────
-image_cache: dict[str, bytes] = {}   # url → bytes
-rss_cache:   dict             = {}   # {'items': [...], 'ts': float}
-cache_lock   = threading.Lock()
+rss_cache  = {}
+cache_lock = threading.Lock()
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
     'Referer':    'https://open.spotify.com/',
 }
 
-# ─── Téléchargement image en cache ────────────────────────────────────────────
-def fetch_image_cached(url: str) -> bytes | None:
-    with cache_lock:
-        if url in image_cache:
-            return image_cache[url]
+# ─── Cache images sur disque /tmp ─────────────────────────────────────────────
+def cache_path(url):
+    h = hashlib.md5(url.encode()).hexdigest()
+    return os.path.join(CACHE_DIR, h)
+
+def fetch_image_cached(url):
+    path = cache_path(url)
+    if os.path.exists(path):
+        with open(path, 'rb') as f:
+            return f.read()
     try:
         r = requests.get(url, timeout=15, headers=HEADERS)
         if r.status_code == 200:
-            with cache_lock:
-                image_cache[url] = r.content
+            with open(path, 'wb') as f:
+                f.write(r.content)
             return r.content
     except Exception:
         pass
     return None
 
-def prefetch_images(urls: list[str]):
-    """Précharge les images en arrière-plan."""
+def prefetch_images(urls):
     for url in urls:
-        if url and url not in image_cache:
+        if url and not os.path.exists(cache_path(url)):
             fetch_image_cached(url)
 
 # ─── Proxy image ───────────────────────────────────────────────────────────────
@@ -56,11 +62,9 @@ def proxy_image():
 # ─── RSS parsé en JSON ─────────────────────────────────────────────────────────
 @app.route('/rss')
 def proxy_rss():
-    import time
     with cache_lock:
         cached = rss_cache.get('data')
         ts     = rss_cache.get('ts', 0)
-    # Cache RSS valide 30 minutes
     if cached and (time.time() - ts) < 1800:
         return jsonify(cached)
 
@@ -73,7 +77,6 @@ def proxy_rss():
         ns      = {'itunes': 'http://www.itunes.com/dtds/podcast-1.0.dtd'}
         channel = root.find('channel')
 
-        # Image podcast fallback
         podcast_image = None
         img_el = channel.find('itunes:image', ns)
         if img_el is not None:
@@ -95,7 +98,6 @@ def proxy_rss():
 
             titre_raw = get('title').replace('<![CDATA[', '').replace(']]>', '').strip()
 
-            # Extraction émission / sousTitre
             if re.search(r'interview', titre_raw, re.IGNORECASE):
                 emission   = 'Interview'
                 sous_titre = re.sub(r'interview', '', titre_raw, flags=re.IGNORECASE).lstrip(' :-').strip()
@@ -108,28 +110,24 @@ def proxy_rss():
                     emission   = titre_raw
                     sous_titre = ''
 
-            # Audio
             enclosure = item.find('enclosure')
             audio_url = enclosure.get('url') if enclosure is not None else None
             if not audio_url:
                 continue
 
-            # Pochette
-            img_item    = item.find('itunes:image', ns)
+            img_item     = item.find('itunes:image', ns)
             pochette_raw = img_item.get('href') if img_item is not None else None
-            pochette    = proxy_url(pochette_raw or podcast_image)
+            pochette     = proxy_url(pochette_raw or podcast_image)
 
-            # Durée
             duree_el  = item.find('itunes:duration', ns)
             duree_raw = (duree_el.text or '').strip() if duree_el is not None else ''
             if duree_raw.isdigit():
                 secs = int(duree_raw)
-                h, m, s = secs//3600, (secs%3600)//60, secs%60
+                h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
                 duree = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
             else:
                 duree = duree_raw
 
-            # Description
             desc_el  = item.find('description') or item.find('{http://www.itunes.com/dtds/podcast-1.0.dtd}summary')
             desc_raw = (desc_el.text or '') if desc_el is not None else ''
             desc_raw = desc_raw.replace('<![CDATA[', '').replace(']]>', '')
@@ -158,15 +156,17 @@ def proxy_rss():
 
         result = {'items': items, 'count': len(items)}
 
-        # Mettre en cache RSS
-        import time
         with cache_lock:
             rss_cache['data'] = result
             rss_cache['ts']   = time.time()
 
-        # Précharger toutes les images en arrière-plan
-        urls = list({it['pochette'].split('url=')[-1] for it in items if it['pochette'] and 'url=' in it['pochette']})
-        threading.Thread(target=prefetch_images, args=(urls,), daemon=True).start()
+        # Précharger images en arrière-plan
+        raw_urls = []
+        for it in items:
+            if it['pochette'] and 'url=' in it['pochette']:
+                raw_urls.append(requests.utils.unquote(it['pochette'].split('url=')[-1]))
+        raw_urls = list(set(raw_urls))
+        threading.Thread(target=prefetch_images, args=(raw_urls,), daemon=True).start()
 
         return jsonify(result)
 
@@ -176,7 +176,8 @@ def proxy_rss():
 # ─── Health check ──────────────────────────────────────────────────────────────
 @app.route('/')
 def health():
-    return jsonify({'status': 'ok', 'service': 'radiohdr-rss-proxy', 'cached_images': len(image_cache)})
+    cached = len(os.listdir(CACHE_DIR)) if os.path.exists(CACHE_DIR) else 0
+    return jsonify({'status': 'ok', 'service': 'radiohdr-rss-proxy', 'cached_images': cached})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
