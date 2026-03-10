@@ -1,11 +1,45 @@
 import os
+import re
+import html
+import threading
 import requests
 from flask import Flask, Response, request, jsonify
 from xml.etree import ElementTree as ET
 
 app = Flask(__name__)
 
-RSS_URL = 'https://anchor.fm/s/1016b2f68/podcast/rss'
+RSS_URL  = 'https://anchor.fm/s/1016b2f68/podcast/rss'
+
+# ─── Cache en mémoire ──────────────────────────────────────────────────────────
+image_cache: dict[str, bytes] = {}   # url → bytes
+rss_cache:   dict             = {}   # {'items': [...], 'ts': float}
+cache_lock   = threading.Lock()
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+    'Referer':    'https://open.spotify.com/',
+}
+
+# ─── Téléchargement image en cache ────────────────────────────────────────────
+def fetch_image_cached(url: str) -> bytes | None:
+    with cache_lock:
+        if url in image_cache:
+            return image_cache[url]
+    try:
+        r = requests.get(url, timeout=15, headers=HEADERS)
+        if r.status_code == 200:
+            with cache_lock:
+                image_cache[url] = r.content
+            return r.content
+    except Exception:
+        pass
+    return None
+
+def prefetch_images(urls: list[str]):
+    """Précharge les images en arrière-plan."""
+    for url in urls:
+        if url and url not in image_cache:
+            fetch_image_cached(url)
 
 # ─── Proxy image ───────────────────────────────────────────────────────────────
 @app.route('/image')
@@ -13,32 +47,33 @@ def proxy_image():
     url = request.args.get('url')
     if not url:
         return Response('Missing url', status=400)
-    try:
-        r = requests.get(url, timeout=20, headers={
-            'User-Agent': 'Mozilla/5.0',
-            'Referer':    'https://open.spotify.com/',
-        })
-        return Response(
-            r.content,
-            content_type=r.headers.get('Content-Type', 'image/jpeg'),
-            headers={'Cache-Control': 'public, max-age=86400'}
-        )
-    except Exception as e:
-        return Response(str(e), status=502)
+    data = fetch_image_cached(url)
+    if data:
+        return Response(data, content_type='image/jpeg',
+                        headers={'Cache-Control': 'public, max-age=86400'})
+    return Response('Image unavailable', status=502)
 
 # ─── RSS parsé en JSON ─────────────────────────────────────────────────────────
 @app.route('/rss')
 def proxy_rss():
+    import time
+    with cache_lock:
+        cached = rss_cache.get('data')
+        ts     = rss_cache.get('ts', 0)
+    # Cache RSS valide 30 minutes
+    if cached and (time.time() - ts) < 1800:
+        return jsonify(cached)
+
     try:
-        r = requests.get(RSS_URL, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+        r = requests.get(RSS_URL, timeout=20, headers={'User-Agent': 'Mozilla/5.0'})
         r.raise_for_status()
         xml = r.text
 
-        # Image podcast fallback
-        root = ET.fromstring(xml.encode('utf-8'))
-        ns = {'itunes': 'http://www.itunes.com/dtds/podcast-1.0.dtd'}
+        root    = ET.fromstring(xml.encode('utf-8'))
+        ns      = {'itunes': 'http://www.itunes.com/dtds/podcast-1.0.dtd'}
         channel = root.find('channel')
 
+        # Image podcast fallback
         podcast_image = None
         img_el = channel.find('itunes:image', ns)
         if img_el is not None:
@@ -47,26 +82,22 @@ def proxy_rss():
         base_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'localhost:5000')
         base_url = f"https://{base_url}" if not base_url.startswith('http') else base_url
 
-        # proxy_img désactivé — URLs brutes retournées
+        def proxy_url(u):
+            if not u:
+                return None
+            return f"{base_url}/image?url={requests.utils.quote(u, safe='')}"
 
         items = []
         for item in channel.findall('item'):
-            def get(tag, attr=None):
+            def get(tag):
                 el = item.find(tag) or item.find(tag, ns)
-                if el is None:
-                    return None
-                if attr:
-                    return el.get(attr)
-                return (el.text or '').strip()
+                return (el.text or '').strip() if el is not None else ''
 
-            titre_raw = get('title') or ''
-            # Nettoyage CDATA
-            titre_raw = titre_raw.replace('<![CDATA[', '').replace(']]>', '').strip()
+            titre_raw = get('title').replace('<![CDATA[', '').replace(']]>', '').strip()
 
             # Extraction émission / sousTitre
-            import re
             if re.search(r'interview', titre_raw, re.IGNORECASE):
-                emission  = 'Interview'
+                emission   = 'Interview'
                 sous_titre = re.sub(r'interview', '', titre_raw, flags=re.IGNORECASE).lstrip(' :-').strip()
             else:
                 sep = re.match(r'^(.+?)(?:\s+-\s+|:)(.*)$', titre_raw)
@@ -77,23 +108,19 @@ def proxy_rss():
                     emission   = titre_raw
                     sous_titre = ''
 
-            # Audio URL
+            # Audio
             enclosure = item.find('enclosure')
             audio_url = enclosure.get('url') if enclosure is not None else None
-
             if not audio_url:
                 continue
 
-            # Pochette épisode
-            img_item = item.find('itunes:image', ns)
+            # Pochette
+            img_item    = item.find('itunes:image', ns)
             pochette_raw = img_item.get('href') if img_item is not None else None
-            pochette = pochette_raw or podcast_image  # URL brute, pas de proxy
-
-            # Date
-            pub_date = get('pubDate') or ''
+            pochette    = proxy_url(pochette_raw or podcast_image)
 
             # Durée
-            duree_el = item.find('itunes:duration', ns)
+            duree_el  = item.find('itunes:duration', ns)
             duree_raw = (duree_el.text or '').strip() if duree_el is not None else ''
             if duree_raw.isdigit():
                 secs = int(duree_raw)
@@ -103,10 +130,9 @@ def proxy_rss():
                 duree = duree_raw
 
             # Description
-            desc_el = item.find('description') or item.find('{http://www.itunes.com/dtds/podcast-1.0.dtd}summary')
+            desc_el  = item.find('description') or item.find('{http://www.itunes.com/dtds/podcast-1.0.dtd}summary')
             desc_raw = (desc_el.text or '') if desc_el is not None else ''
             desc_raw = desc_raw.replace('<![CDATA[', '').replace(']]>', '')
-            import html
             description = html.unescape(re.sub('<[^>]+>', '', desc_raw)).strip()
 
             items.append({
@@ -115,13 +141,13 @@ def proxy_rss():
                 'emission':    emission,
                 'sousTitre':   sous_titre,
                 'description': description,
-                'date':        pub_date,
+                'date':        get('pubDate'),
                 'duree':       duree,
                 'pochette':    pochette,
                 'audioUrl':    audio_url,
             })
 
-        # Propager pochettes manquantes par émission
+        # Propager pochettes par émission
         pochettes = {}
         for it in items:
             if it['pochette'] and it['emission']:
@@ -130,7 +156,19 @@ def proxy_rss():
             if not it['pochette'] and it['emission'] in pochettes:
                 it['pochette'] = pochettes[it['emission']]
 
-        return jsonify({'items': items, 'count': len(items)})
+        result = {'items': items, 'count': len(items)}
+
+        # Mettre en cache RSS
+        import time
+        with cache_lock:
+            rss_cache['data'] = result
+            rss_cache['ts']   = time.time()
+
+        # Précharger toutes les images en arrière-plan
+        urls = list({it['pochette'].split('url=')[-1] for it in items if it['pochette'] and 'url=' in it['pochette']})
+        threading.Thread(target=prefetch_images, args=(urls,), daemon=True).start()
+
+        return jsonify(result)
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -138,7 +176,7 @@ def proxy_rss():
 # ─── Health check ──────────────────────────────────────────────────────────────
 @app.route('/')
 def health():
-    return jsonify({'status': 'ok', 'service': 'radiohdr-rss-proxy'})
+    return jsonify({'status': 'ok', 'service': 'radiohdr-rss-proxy', 'cached_images': len(image_cache)})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
