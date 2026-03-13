@@ -269,109 +269,108 @@ def transcribe_all():
         print('[all] 🔒 verrou activé — appels individuels bloqués')
         try:
             for item in items:
-            item_id  = item['id']
-            audio_url = item['audioUrl']
+                item_id   = item['id']
+                audio_url = item['audioUrl']
 
-            # Vérifier cache Firestore
-            fields = firestore_get('transcriptions', item_id)
-            if fields and fields.get('text', {}).get('stringValue'):
-                print(f'[all] déjà transcrit : {item_id}')
-                results['skipped'] += 1
-                continue
+                # Vérifier cache Firestore
+                fields = firestore_get('transcriptions', item_id)
+                if fields and fields.get('text', {}).get('stringValue'):
+                    print(f'[all] déjà transcrit : {item_id}')
+                    results['skipped'] += 1
+                    continue
 
-            groq_key = os.environ.get('HDR_GROQ_KEY')
-            if not groq_key:
-                results['errors'].append({'id': item_id, 'error': 'HDR_GROQ_KEY manquante'})
-                continue
+                groq_key = os.environ.get('HDR_GROQ_KEY')
+                if not groq_key:
+                    results['errors'].append({'id': item_id, 'error': 'HDR_GROQ_KEY manquante'})
+                    continue
 
-            try:
-                print(f'[all] transcription : {item_id} — {item["titre"]}')
-                audio_resp = requests.get(audio_url, timeout=60, headers=HEADERS, stream=True)
-                audio_resp.raise_for_status()
+                try:
+                    print(f'[all] transcription : {item_id} — {item["titre"]}')
+                    audio_resp = requests.get(audio_url, timeout=60, headers=HEADERS, stream=True)
+                    audio_resp.raise_for_status()
 
-                with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
-                    for chunk in audio_resp.iter_content(chunk_size=8192):
-                        tmp.write(chunk)
-                    tmp_path = tmp.name
+                    with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
+                        for chunk in audio_resp.iter_content(chunk_size=8192):
+                            tmp.write(chunk)
+                        tmp_path = tmp.name
 
-                import subprocess
-                probe = subprocess.run(
-                    ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                     '-of', 'default=noprint_wrappers=1:nokey=1', tmp_path],
-                    capture_output=True, text=True
-                )
-                total_sec   = float(probe.stdout.strip() or '0')
-                segment_sec = 10 * 60
-                starts      = list(range(0, int(total_sec), segment_sec))
-                print(f'[all] {item_id} : {total_sec:.0f}s → {len(starts)} segment(s)')
+                    import subprocess
+                    probe = subprocess.run(
+                        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                         '-of', 'default=noprint_wrappers=1:nokey=1', tmp_path],
+                        capture_output=True, text=True
+                    )
+                    total_sec   = float(probe.stdout.strip() or '0')
+                    segment_sec = 10 * 60
+                    starts      = list(range(0, int(total_sec), segment_sec))
+                    print(f'[all] {item_id} : {total_sec:.0f}s → {len(starts)} segment(s)')
 
-                full_text = []
-                for idx, start in enumerate(starts):
-                    with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as stmp:
-                        seg_path = stmp.name
-                    subprocess.run([
-                        'ffmpeg', '-y', '-ss', str(start), '-t', str(segment_sec),
-                        '-i', tmp_path, '-q:a', '5', seg_path
-                    ], capture_output=True)
+                    full_text = []
+                    for idx, start in enumerate(starts):
+                        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as stmp:
+                            seg_path = stmp.name
+                        subprocess.run([
+                            'ffmpeg', '-y', '-ss', str(start), '-t', str(segment_sec),
+                            '-i', tmp_path, '-q:a', '5', seg_path
+                        ], capture_output=True)
 
-                    # Retry avec backoff exponentiel sur 429
-                    seg_ok = False
-                    for attempt in range(5):
-                        with open(seg_path, 'rb') as f:
-                            groq_resp = requests.post(
-                                'https://api.groq.com/openai/v1/audio/transcriptions',
-                                headers={'Authorization': f'Bearer {groq_key}'},
-                                files={'file': ('audio.mp3', f, 'audio/mpeg')},
-                                data={'model': 'whisper-large-v3', 'language': 'fr', 'response_format': 'text'},
-                                timeout=300,
-                            )
-                        if groq_resp.status_code == 200:
-                            full_text.append(groq_resp.text.strip())
-                            seg_ok = True
-                            break
-                        elif groq_resp.status_code == 429:
-                            wait = 30 * (2 ** attempt)  # 30s, 60s, 120s, 240s, 480s
-                            print(f'[all] rate limit segment {idx+1}, attente {wait}s (tentative {attempt+1}/5)...')
-                            time.sleep(wait)
-                        else:
-                            print(f'[all] erreur Groq segment {idx+1} : {groq_resp.status_code}')
-                            break
+                        # Retry avec backoff exponentiel sur 429
+                        seg_ok = False
+                        for attempt in range(5):
+                            with open(seg_path, 'rb') as f:
+                                groq_resp = requests.post(
+                                    'https://api.groq.com/openai/v1/audio/transcriptions',
+                                    headers={'Authorization': f'Bearer {groq_key}'},
+                                    files={'file': ('audio.mp3', f, 'audio/mpeg')},
+                                    data={'model': 'whisper-large-v3', 'language': 'fr', 'response_format': 'text'},
+                                    timeout=300,
+                                )
+                            if groq_resp.status_code == 200:
+                                full_text.append(groq_resp.text.strip())
+                                seg_ok = True
+                                break
+                            elif groq_resp.status_code == 429:
+                                wait = 30 * (2 ** attempt)  # 30s, 60s, 120s, 240s, 480s
+                                print(f'[all] rate limit segment {idx+1}, attente {wait}s (tentative {attempt+1}/5)...')
+                                time.sleep(wait)
+                            else:
+                                print(f'[all] erreur Groq segment {idx+1} : {groq_resp.status_code}')
+                                break
 
-                    if not seg_ok:
-                        print(f'[all] ⚠ segment {idx+1} échoué après 5 tentatives')
+                        if not seg_ok:
+                            print(f'[all] ⚠ segment {idx+1} échoué après 5 tentatives')
 
-                    os.unlink(seg_path)
-                    time.sleep(30)  # pause entre segments
+                        os.unlink(seg_path)
+                        time.sleep(30)  # pause entre segments
 
-                os.unlink(tmp_path)
-                text = '\n\n'.join(full_text)
+                    os.unlink(tmp_path)
+                    text = '\n\n'.join(full_text)
 
-                # Ne sauvegarder que si TOUS les segments ont réussi
-                if len(full_text) == len(starts) and text.strip():
-                    firestore_set('transcriptions', item_id, {
-                        'text':       text,
-                        'item_id':    item_id,
-                        'audio_url':  audio_url,
-                        'created_at': str(int(time.time())),
-                    })
-                    print(f'[all] ✅ {item_id} sauvegardé ({len(text)} chars)')
-                    results['done'] += 1
-                else:
-                    print(f'[all] ⚠ {item_id} incomplet — {len(full_text)}/{len(starts)} segments')
-                    # Supprimer le doc Firestore s'il existe (résidu d'un run précédent)
-                    url = f'{FIRESTORE_BASE}/transcriptions/{item_id}'
-                    try:
-                        r = requests.delete(url, timeout=10)
-                        if r.status_code in (200, 204):
-                            print(f'[all] 🗑 {item_id} supprimé de Firestore')
-                    except:
-                        pass
+                    # Ne sauvegarder que si TOUS les segments ont réussi
+                    if len(full_text) == len(starts) and text.strip():
+                        firestore_set('transcriptions', item_id, {
+                            'text':       text,
+                            'item_id':    item_id,
+                            'audio_url':  audio_url,
+                            'created_at': str(int(time.time())),
+                        })
+                        print(f'[all] ✅ {item_id} sauvegardé ({len(text)} chars)')
+                        results['done'] += 1
+                    else:
+                        print(f'[all] ⚠ {item_id} incomplet — {len(full_text)}/{len(starts)} segments')
+                        url = f'{FIRESTORE_BASE}/transcriptions/{item_id}'
+                        try:
+                            r = requests.delete(url, timeout=10)
+                            if r.status_code in (200, 204):
+                                print(f'[all] 🗑 {item_id} supprimé de Firestore')
+                        except:
+                            pass
 
-                time.sleep(45)  # pause entre épisodes
+                    time.sleep(45)  # pause entre épisodes
 
-            except Exception as e:
-                print(f'[all] erreur {item_id} : {e}')
-                results['errors'].append({'id': item_id, 'error': str(e)})
+                except Exception as e:
+                    print(f'[all] erreur {item_id} : {e}')
+                    results['errors'].append({'id': item_id, 'error': str(e)})
         finally:
             bulk_running = False
             print('[all] 🔓 verrou libéré — appels individuels autorisés')
