@@ -2,3 +2,5 @@ flask==3.0.3
 requests==2.31.0
 gunicorn==21.2.0
 firebase-admin
+pydub
+ffmpeg-python
