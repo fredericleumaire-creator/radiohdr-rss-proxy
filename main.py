@@ -144,7 +144,7 @@ def transcribe(item_id):
         return jsonify({'error': 'Replay introuvable'}), 404
 
     # 3. Télécharger le MP3
-    groq_key = os.environ.get('GROQ_API_KEY')
+    groq_key = os.environ.get('HDR_GROQ_KEY')
     if not groq_key:
         return jsonify({'error': 'GROQ_API_KEY manquante'}), 500
 
