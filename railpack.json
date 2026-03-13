@@ -5,5 +5,7 @@
   "deploy": {
     "secrets": []
   },
-  "packages": ["ffmpeg"]
+  "packages": {
+    "ffmpeg": "latest"
+  }
 }
