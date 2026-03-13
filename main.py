@@ -161,31 +161,40 @@ def transcribe(item_id):
                 tmp.write(chunk)
             tmp_path = tmp.name
 
-        # 4. Découper en segments et transcrire
+        # 4. Découper en segments avec ffmpeg CLI et transcrire
         print(f'[transcription] découpage audio en segments...')
-        from pydub import AudioSegment
-        audio = AudioSegment.from_mp3(tmp_path)
-        os.unlink(tmp_path)
+        import subprocess
 
-        segment_ms  = 10 * 60 * 1000  # 10 minutes par segment
-        segments    = [audio[i:i+segment_ms] for i in range(0, len(audio), segment_ms)]
-        print(f'[transcription] {len(segments)} segment(s) à transcrire')
+        # Obtenir la durée totale
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', tmp_path],
+            capture_output=True, text=True
+        )
+        total_sec = float(probe.stdout.strip() or '0')
+        segment_sec = 10 * 60  # 10 minutes
+        starts = list(range(0, int(total_sec), segment_sec))
+        print(f'[transcription] durée {total_sec:.0f}s → {len(starts)} segment(s)')
 
         full_text = []
-        for idx, seg in enumerate(segments):
+        for idx, start in enumerate(starts):
             with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as stmp:
-                seg.export(stmp.name, format='mp3')
                 seg_path = stmp.name
 
-            print(f'[transcription] segment {idx+1}/{len(segments)}...')
+            subprocess.run([
+                'ffmpeg', '-y', '-ss', str(start), '-t', str(segment_sec),
+                '-i', tmp_path, '-q:a', '5', seg_path
+            ], capture_output=True)
+
+            print(f'[transcription] segment {idx+1}/{len(starts)}...')
             with open(seg_path, 'rb') as f:
                 groq_resp = requests.post(
                     'https://api.groq.com/openai/v1/audio/transcriptions',
                     headers={'Authorization': f'Bearer {groq_key}'},
                     files={'file': ('audio.mp3', f, 'audio/mpeg')},
                     data={
-                        'model':         'whisper-large-v3',
-                        'language':      'fr',
+                        'model':           'whisper-large-v3',
+                        'language':        'fr',
                         'response_format': 'text',
                     },
                     timeout=300,
@@ -193,10 +202,12 @@ def transcribe(item_id):
             os.unlink(seg_path)
 
             if groq_resp.status_code != 200:
+                os.unlink(tmp_path)
                 return jsonify({'error': f'Groq error {groq_resp.status_code}', 'detail': groq_resp.text}), 502
 
             full_text.append(groq_resp.text.strip())
 
+        os.unlink(tmp_path)
         text = '\n\n'.join(full_text)
         print(f'[transcription] ✅ {len(text)} caractères')
 
