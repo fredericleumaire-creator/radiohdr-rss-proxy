@@ -9,21 +9,26 @@ HEADERS = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://open.spotify.com/'}
 rss_cache  = {}
 cache_lock = threading.Lock()
 
-# ─── Firebase init (optionnel — uniquement si GOOGLE_TOKEN_JSON présent) ──────
-db = None
-try:
-    import firebase_admin
-    from firebase_admin import credentials, firestore
+FIRESTORE_BASE = 'https://firestore.googleapis.com/v1/projects/radiohdr-39922/databases/(default)/documents'
 
-    token_json = os.environ.get('GOOGLE_TOKEN_JSON')
-    if token_json:
-        cred_dict = json.loads(token_json)
-        cred      = credentials.Certificate(cred_dict)
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
-        print('[firebase] connecté')
-except Exception as e:
-    print(f'[firebase] non disponible : {e}')
+def firestore_get(collection, doc_id):
+    url = f'{FIRESTORE_BASE}/{collection}/{doc_id}'
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            return r.json().get('fields', {})
+    except:
+        pass
+    return None
+
+def firestore_set(collection, doc_id, data):
+    url = f'{FIRESTORE_BASE}/{collection}/{doc_id}'
+    fields = {k: {'stringValue': str(v)} for k, v in data.items()}
+    body = json.dumps({'fields': fields})
+    try:
+        requests.patch(url, data=body, headers={'Content-Type': 'application/json'}, timeout=10)
+    except:
+        pass
 
 # ─── Proxy image ───────────────────────────────────────────────────────────────
 @app.route('/image')
@@ -113,13 +118,11 @@ def proxy_rss():
 @app.route('/transcribe/<item_id>')
 def transcribe(item_id):
     # 1. Vérifier le cache Firestore
-    if db:
-        doc = db.collection('transcriptions').document(item_id).get()
-        if doc.exists:
-            data = doc.to_dict()
-            if data.get('text'):
-                print(f'[transcription] cache hit : {item_id}')
-                return jsonify({'id': item_id, 'text': data['text'], 'cached': True})
+    fields = firestore_get('transcriptions', item_id)
+    if fields and fields.get('text', {}).get('stringValue'):
+        text = fields['text']['stringValue']
+        print(f'[transcription] cache hit : {item_id}')
+        return jsonify({'id': item_id, 'text': text, 'cached': True})
 
     # 2. Retrouver l'audioUrl depuis le RSS
     with cache_lock:
@@ -158,37 +161,53 @@ def transcribe(item_id):
                 tmp.write(chunk)
             tmp_path = tmp.name
 
-        # 4. Envoyer à Groq Whisper
-        print(f'[transcription] envoi à Groq Whisper...')
-        with open(tmp_path, 'rb') as f:
-            groq_resp = requests.post(
-                'https://api.groq.com/openai/v1/audio/transcriptions',
-                headers={'Authorization': f'Bearer {groq_key}'},
-                files={'file': ('audio.mp3', f, 'audio/mpeg')},
-                data={
-                    'model':    'whisper-large-v3',
-                    'language': 'fr',
-                    'response_format': 'text',
-                },
-                timeout=300,
-            )
+        # 4. Découper en segments et transcrire
+        print(f'[transcription] découpage audio en segments...')
+        from pydub import AudioSegment
+        audio = AudioSegment.from_mp3(tmp_path)
         os.unlink(tmp_path)
 
-        if groq_resp.status_code != 200:
-            return jsonify({'error': f'Groq error {groq_resp.status_code}', 'detail': groq_resp.text}), 502
+        segment_ms  = 10 * 60 * 1000  # 10 minutes par segment
+        segments    = [audio[i:i+segment_ms] for i in range(0, len(audio), segment_ms)]
+        print(f'[transcription] {len(segments)} segment(s) à transcrire')
 
-        text = groq_resp.text.strip()
+        full_text = []
+        for idx, seg in enumerate(segments):
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as stmp:
+                seg.export(stmp.name, format='mp3')
+                seg_path = stmp.name
+
+            print(f'[transcription] segment {idx+1}/{len(segments)}...')
+            with open(seg_path, 'rb') as f:
+                groq_resp = requests.post(
+                    'https://api.groq.com/openai/v1/audio/transcriptions',
+                    headers={'Authorization': f'Bearer {groq_key}'},
+                    files={'file': ('audio.mp3', f, 'audio/mpeg')},
+                    data={
+                        'model':         'whisper-large-v3',
+                        'language':      'fr',
+                        'response_format': 'text',
+                    },
+                    timeout=300,
+                )
+            os.unlink(seg_path)
+
+            if groq_resp.status_code != 200:
+                return jsonify({'error': f'Groq error {groq_resp.status_code}', 'detail': groq_resp.text}), 502
+
+            full_text.append(groq_resp.text.strip())
+
+        text = '\n\n'.join(full_text)
         print(f'[transcription] ✅ {len(text)} caractères')
 
-        # 5. Stocker en Firestore
-        if db:
-            db.collection('transcriptions').document(item_id).set({
-                'text':       text,
-                'item_id':    item_id,
-                'audio_url':  audio_url,
-                'created_at': int(time.time()),
-            })
-            print(f'[transcription] sauvegardé Firestore : {item_id}')
+        # 5. Stocker en Firestore via API REST
+        firestore_set('transcriptions', item_id, {
+            'text':       text,
+            'item_id':    item_id,
+            'audio_url':  audio_url,
+            'created_at': str(int(time.time())),
+        })
+        print(f'[transcription] sauvegardé Firestore : {item_id}')
 
         return jsonify({'id': item_id, 'text': text, 'cached': False})
 
@@ -198,16 +217,14 @@ def transcribe(item_id):
 # ─── Statut transcription (sans déclencher) ───────────────────────────────────
 @app.route('/transcribe/<item_id>/status')
 def transcribe_status(item_id):
-    if not db:
-        return jsonify({'available': False, 'reason': 'Firestore non configuré'})
-    doc = db.collection('transcriptions').document(item_id).get()
-    if doc.exists and doc.to_dict().get('text'):
+    fields = firestore_get('transcriptions', item_id)
+    if fields and fields.get('text', {}).get('stringValue'):
         return jsonify({'available': True, 'cached': True})
     return jsonify({'available': False, 'cached': False})
 
 @app.route('/')
 def health():
-    return jsonify({'status': 'ok', 'service': 'radiohdr-rss-proxy', 'firebase': db is not None})
+    return jsonify({'status': 'ok', 'service': 'radiohdr-rss-proxy'})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
