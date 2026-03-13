@@ -291,32 +291,60 @@ def transcribe_all():
                         '-i', tmp_path, '-q:a', '5', seg_path
                     ], capture_output=True)
 
-                    with open(seg_path, 'rb') as f:
-                        groq_resp = requests.post(
-                            'https://api.groq.com/openai/v1/audio/transcriptions',
-                            headers={'Authorization': f'Bearer {groq_key}'},
-                            files={'file': ('audio.mp3', f, 'audio/mpeg')},
-                            data={'model': 'whisper-large-v3', 'language': 'fr', 'response_format': 'text'},
-                            timeout=300,
-                        )
-                    os.unlink(seg_path)
+                    # Retry avec backoff exponentiel sur 429
+                    seg_ok = False
+                    for attempt in range(5):
+                        with open(seg_path, 'rb') as f:
+                            groq_resp = requests.post(
+                                'https://api.groq.com/openai/v1/audio/transcriptions',
+                                headers={'Authorization': f'Bearer {groq_key}'},
+                                files={'file': ('audio.mp3', f, 'audio/mpeg')},
+                                data={'model': 'whisper-large-v3', 'language': 'fr', 'response_format': 'text'},
+                                timeout=300,
+                            )
+                        if groq_resp.status_code == 200:
+                            full_text.append(groq_resp.text.strip())
+                            seg_ok = True
+                            break
+                        elif groq_resp.status_code == 429:
+                            wait = 30 * (2 ** attempt)  # 30s, 60s, 120s, 240s, 480s
+                            print(f'[all] rate limit segment {idx+1}, attente {wait}s (tentative {attempt+1}/5)...')
+                            time.sleep(wait)
+                        else:
+                            print(f'[all] erreur Groq segment {idx+1} : {groq_resp.status_code}')
+                            break
 
-                    if groq_resp.status_code == 200:
-                        full_text.append(groq_resp.text.strip())
-                    else:
-                        print(f'[all] erreur Groq segment {idx+1} : {groq_resp.status_code}')
+                    if not seg_ok:
+                        print(f'[all] ⚠ segment {idx+1} échoué après 5 tentatives')
+
+                    os.unlink(seg_path)
+                    time.sleep(30)  # pause entre segments
 
                 os.unlink(tmp_path)
                 text = '\n\n'.join(full_text)
 
-                firestore_set('transcriptions', item_id, {
-                    'text':       text,
-                    'item_id':    item_id,
-                    'audio_url':  audio_url,
-                    'created_at': str(int(time.time())),
-                })
-                print(f'[all] ✅ {item_id} sauvegardé ({len(text)} chars)')
-                results['done'] += 1
+                # Ne sauvegarder que si TOUS les segments ont réussi
+                if len(full_text) == len(starts) and text.strip():
+                    firestore_set('transcriptions', item_id, {
+                        'text':       text,
+                        'item_id':    item_id,
+                        'audio_url':  audio_url,
+                        'created_at': str(int(time.time())),
+                    })
+                    print(f'[all] ✅ {item_id} sauvegardé ({len(text)} chars)')
+                    results['done'] += 1
+                else:
+                    print(f'[all] ⚠ {item_id} incomplet — {len(full_text)}/{len(starts)} segments')
+                    # Supprimer le doc Firestore s'il existe (résidu d'un run précédent)
+                    url = f'{FIRESTORE_BASE}/transcriptions/{item_id}'
+                    try:
+                        r = requests.delete(url, timeout=10)
+                        if r.status_code in (200, 204):
+                            print(f'[all] 🗑 {item_id} supprimé de Firestore')
+                    except:
+                        pass
+
+                time.sleep(45)  # pause entre épisodes
 
             except Exception as e:
                 print(f'[all] erreur {item_id} : {e}')
@@ -339,6 +367,49 @@ def transcribe_status(item_id):
     if fields and fields.get('text', {}).get('stringValue'):
         return jsonify({'available': True, 'cached': True})
     return jsonify({'available': False, 'cached': False})
+
+# ─── Nettoyage des transcriptions vides ───────────────────────────────────────
+@app.route('/transcribe/cleanup')
+def transcribe_cleanup():
+    with cache_lock:
+        cached = rss_cache.get('data')
+    if not cached:
+        try:
+            proxy_rss()
+            with cache_lock:
+                cached = rss_cache.get('data')
+        except:
+            pass
+    if not cached:
+        return jsonify({'error': 'RSS non disponible'}), 500
+
+    items   = cached.get('items', [])
+    deleted = []
+    kept    = []
+
+    for item in items:
+        item_id = item['id']
+        fields  = firestore_get('transcriptions', item_id)
+        if fields is None:
+            continue  # pas de doc, rien à faire
+        text = fields.get('text', {}).get('stringValue', '')
+        if not text.strip():
+            # Supprimer le doc vide via API REST
+            url = f'{FIRESTORE_BASE}/transcriptions/{item_id}'
+            try:
+                requests.delete(url, timeout=10)
+                deleted.append(item_id)
+                print(f'[cleanup] supprimé : {item_id}')
+            except Exception as e:
+                print(f'[cleanup] erreur suppression {item_id} : {e}')
+        else:
+            kept.append(item_id)
+
+    return jsonify({
+        'deleted': len(deleted),
+        'kept':    len(kept),
+        'ids':     deleted,
+    })
 
 @app.route('/')
 def health():
