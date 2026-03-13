@@ -3,6 +3,7 @@
     "secrets": []
   },
   "deploy": {
-    "secrets": []
+    "secrets": [],
+    "aptPackages": ["ffmpeg"]
   }
 }
