@@ -146,7 +146,7 @@ def transcribe(item_id):
     # 3. Télécharger le MP3
     groq_key = os.environ.get('HDR_GROQ_KEY')
     if not groq_key:
-        return jsonify({'error': 'GROQ_API_KEY manquante'}), 500
+        return jsonify({'error': 'HDR_GROQ_KEY manquante'}), 500
 
     try:
         print(f'[transcription] téléchargement audio : {audio_url}')
