@@ -368,7 +368,7 @@ def transcribe_all():
                         except:
                             pass
 
-                    time.sleep(10)  # pause entre épisodes
+                    time.sleep(60)  # pause entre épisodes — laisse le quota Groq se recharger
 
                 except Exception as e:
                     print(f'[all] erreur {item_id} : {e}')
