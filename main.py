@@ -332,7 +332,6 @@ def transcribe_all():
                             elif groq_resp.status_code == 429:
                                 wait = 30 * (2 ** attempt)  # 30s, 60s
                                 print(f'[all] rate limit segment {idx+1}, attente {wait}s (tentative {attempt+1}/2)...')
-                                print(f'[all] détail Groq : {groq_resp.text[:200]}')
                                 time.sleep(wait)
                             else:
                                 print(f'[all] erreur Groq segment {idx+1} : {groq_resp.status_code}')
@@ -344,7 +343,6 @@ def transcribe_all():
                             break
 
                         os.unlink(seg_path)
-                        time.sleep(10)  # pause entre segments
 
                     os.unlink(tmp_path)
                     text = '\n\n'.join(full_text)
@@ -369,7 +367,6 @@ def transcribe_all():
                         except:
                             pass
 
-                    time.sleep(60)  # pause entre épisodes — laisse le quota Groq se recharger
 
                 except Exception as e:
                     print(f'[all] erreur {item_id} : {e}')
