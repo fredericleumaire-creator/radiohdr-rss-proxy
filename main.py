@@ -338,7 +338,9 @@ def transcribe_all():
                                 break
 
                         if not seg_ok:
-                            print(f'[all] ⚠ segment {idx+1} échoué après 5 tentatives')
+                            print(f'[all] ⚠ segment {idx+1} échoué — abandon de {item_id}')
+                            os.unlink(seg_path)
+                            break
 
                         os.unlink(seg_path)
                         time.sleep(10)  # pause entre segments
