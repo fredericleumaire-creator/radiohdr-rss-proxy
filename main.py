@@ -194,7 +194,7 @@ def transcribe(item_id):
 
             print(f'[transcription] segment {idx+1}/{len(starts)}...')
             seg_ok = False
-            for attempt in range(5):
+            for attempt in range(2):
                 with open(seg_path, 'rb') as f:
                     groq_resp = requests.post(
                         'https://api.groq.com/openai/v1/audio/transcriptions',
@@ -212,8 +212,8 @@ def transcribe(item_id):
                     seg_ok = True
                     break
                 elif groq_resp.status_code == 429:
-                    wait = 30 * (2 ** attempt)  # 30s, 60s, 120s, 240s, 480s
-                    print(f'[transcription] rate limit segment {idx+1}, attente {wait}s (tentative {attempt+1}/5)...')
+                    wait = 30 * (2 ** attempt)  # 30s, 60s
+                    print(f'[transcription] rate limit segment {idx+1}, attente {wait}s (tentative {attempt+1}/2)...')
                     time.sleep(wait)
                 else:
                     os.unlink(seg_path)
@@ -316,7 +316,7 @@ def transcribe_all():
 
                         # Retry avec backoff exponentiel sur 429
                         seg_ok = False
-                        for attempt in range(5):
+                        for attempt in range(2):
                             with open(seg_path, 'rb') as f:
                                 groq_resp = requests.post(
                                     'https://api.groq.com/openai/v1/audio/transcriptions',
@@ -330,8 +330,8 @@ def transcribe_all():
                                 seg_ok = True
                                 break
                             elif groq_resp.status_code == 429:
-                                wait = 30 * (2 ** attempt)  # 30s, 60s, 120s, 240s, 480s
-                                print(f'[all] rate limit segment {idx+1}, attente {wait}s (tentative {attempt+1}/5)...')
+                                wait = 30 * (2 ** attempt)  # 30s, 60s
+                                print(f'[all] rate limit segment {idx+1}, attente {wait}s (tentative {attempt+1}/2)...')
                                 time.sleep(wait)
                             else:
                                 print(f'[all] erreur Groq segment {idx+1} : {groq_resp.status_code}')
@@ -341,7 +341,7 @@ def transcribe_all():
                             print(f'[all] ⚠ segment {idx+1} échoué après 5 tentatives')
 
                         os.unlink(seg_path)
-                        time.sleep(30)  # pause entre segments
+                        time.sleep(10)  # pause entre segments
 
                     os.unlink(tmp_path)
                     text = '\n\n'.join(full_text)
@@ -366,7 +366,7 @@ def transcribe_all():
                         except:
                             pass
 
-                    time.sleep(45)  # pause entre épisodes
+                    time.sleep(10)  # pause entre épisodes
 
                 except Exception as e:
                     print(f'[all] erreur {item_id} : {e}')
